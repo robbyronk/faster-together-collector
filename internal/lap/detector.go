@@ -81,13 +81,20 @@ func (d *Detector) OnPacket(raw []byte) *Completed {
 	// Gate on IsRaceOn. Forza's lap counter sits at 0 during free roam *and*
 	// throughout the first lap of a race, so without this gate every free-roam
 	// frame accumulates under "lap 0" and the eventual flush is an enormous
-	// blob. We only buffer frames captured while a race/event is active; a
-	// 1 -> 0 transition (race ended) discards the in-flight buffer, since an
-	// uncompleted lap is dropped (PRD §2.3). State is cleared so the next race
-	// starts fresh at its own lap 0.
+	// blob. We only buffer frames captured while a race/event is active.
+	//
+	// On a 1→0 transition (race ended):
+	//   - Sprint races (LapNumber never incremented, car actually moved) are
+	//     emitted with LapTimeSec=0; Forza never sets LastLapTimeSec for sprints.
+	//   - All other in-flight buffers (mid-circuit DNF, post-race cool-down lap)
+	//     are dropped. State is cleared so the next race starts fresh.
 	if !dash.IsRaceOn {
+		var completed *Completed
+		if d.state != nil && d.state.currentLap == 0 && d.state.maxSpeed >= 1.0 {
+			completed = d.emit(0)
+		}
 		d.state = nil
-		return nil
+		return completed
 	}
 
 	if d.state == nil {
@@ -102,7 +109,7 @@ func (d *Detector) OnPacket(raw []byte) *Completed {
 		return nil
 
 	case dash.LapNumber == s.currentLap+1:
-		completed := d.emit(dash)
+		completed := d.emit(dash.LastLapTimeSec)
 		s.reset(dash, raw)
 		return completed
 
@@ -112,8 +119,16 @@ func (d *Detector) OnPacket(raw []byte) *Completed {
 		return nil
 
 	default:
-		// lap jumped forward by more than one (e.g. quick race restart with
-		// laps preset). Treat as a session reset.
+		// LapNumber jumped forward by more than one. Two causes:
+		//   1. Race-finish counter update (e.g. 2→9): Forza bumps LapNumber by
+		//      the total lap count when you cross the final finish line, and sets
+		//      LastLapTimeSec to the just-completed lap's time. Emit the buffer.
+		//   2. Quick restart with laps preset: LastLapTimeSec is 0. Drop.
+		if dash.LastLapTimeSec > 0 {
+			completed := d.emit(dash.LastLapTimeSec)
+			s.reset(dash, raw)
+			return completed
+		}
 		s.reset(dash, raw)
 		return nil
 	}
@@ -125,7 +140,7 @@ func (d *Detector) Reset() {
 	d.state = nil
 }
 
-func (d *Detector) emit(triggering forza.Dash) *Completed {
+func (d *Detector) emit(lapTimeSec float32) *Completed {
 	s := d.state
 	concatenated := concat(s.buffer)
 	blob, err := d.gzip(concatenated)
@@ -134,7 +149,7 @@ func (d *Detector) emit(triggering forza.Dash) *Completed {
 	}
 
 	return &Completed{
-		LapTimeSec:       triggering.LastLapTimeSec,
+		LapTimeSec:       lapTimeSec,
 		CarID:            s.carID,
 		CarClass:         s.carClass,
 		PerformanceIndex: s.performanceIndex,

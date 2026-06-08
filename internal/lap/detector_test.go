@@ -102,13 +102,62 @@ func TestDetectorSessionResetDoesNotEmit(t *testing.T) {
 	}
 }
 
-func TestDetectorLapJumpDoesNotEmit(t *testing.T) {
+func TestDetectorLapJumpNoTimeDoesNotEmit(t *testing.T) {
 	d := NewDetector()
 	d.OnPacket(frame(0, 50, 0))
 
-	// Lap jumps forward by 2 (race restart preset) — treat as reset
+	// Large forward jump with no lastLapTime (quick restart preset) — treat as reset.
 	if c := d.OnPacket(frame(5, 50, 0)); c != nil {
-		t.Fatalf("lap jump should not emit, got %+v", c)
+		t.Fatalf("lap jump without lastLapTime should not emit, got %+v", c)
+	}
+}
+
+func TestDetectorFinalLapEmitsOnLargeJump(t *testing.T) {
+	d := NewDetector(WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }))
+	d.OnPacket(frame(0, 60, 0))
+	d.OnPacket(frame(1, 70, 44.2))
+	d.OnPacket(frame(2, 65, 54.8))
+
+	// Race-finish: Forza bumps lap from 2 to 9 and populates LastLapTimeSec.
+	completed := d.OnPacket(frame(9, 0, 39.7))
+	if completed == nil {
+		t.Fatal("expected emit on race-finish large lap jump with lastLapTime set")
+	}
+	if completed.LapTimeSec != 39.7 {
+		t.Errorf("LapTimeSec=%v, want 39.7", completed.LapTimeSec)
+	}
+}
+
+func TestDetectorSprintRaceEmitsOnRaceEnd(t *testing.T) {
+	d := NewDetector(WithClock(func() time.Time { return time.Unix(1700000000, 0).UTC() }))
+	d.OnPacket(raceFrame(true, 0, 40, 0))
+	d.OnPacket(raceFrame(true, 0, 65, 0))
+	d.OnPacket(raceFrame(true, 0, 70, 0))
+
+	// Sprint ends: IsRaceOn drops to 0, lap never incremented, car was moving.
+	completed := d.OnPacket(raceFrame(false, 0, 0, 0))
+	if completed == nil {
+		t.Fatal("expected sprint emit on race end")
+	}
+	if completed.LapTimeSec != 0 {
+		t.Errorf("LapTimeSec=%v, want 0 (sprint time unavailable from telemetry)", completed.LapTimeSec)
+	}
+	if completed.MaxSpeedMps != 70 {
+		t.Errorf("MaxSpeedMps=%v, want 70", completed.MaxSpeedMps)
+	}
+	if n := gunzipLen(t, completed.Blob) / forza.PacketSize; n != 3 {
+		t.Errorf("blob has %d frames, want 3", n)
+	}
+}
+
+func TestDetectorSprintLobbyNoMovementNotEmitted(t *testing.T) {
+	d := NewDetector()
+	d.OnPacket(raceFrame(true, 0, 0, 0))
+	d.OnPacket(raceFrame(true, 0, 0, 0))
+
+	// Race ends but car never moved (pre-race lobby noise) — must not emit.
+	if c := d.OnPacket(raceFrame(false, 0, 0, 0)); c != nil {
+		t.Fatalf("lobby session with zero speed should not emit, got %+v", c)
 	}
 }
 
@@ -139,14 +188,16 @@ func TestDetectorIgnoresFreeRoamFrames(t *testing.T) {
 	}
 }
 
-func TestDetectorRaceEndDiscardsInFlightLap(t *testing.T) {
+func TestDetectorMultiLapDNFDiscardsInFlightLap(t *testing.T) {
 	d := NewDetector()
+	// Complete lap 0 normally, now on lap 1.
 	d.OnPacket(raceFrame(true, 0, 50, 0))
-	d.OnPacket(raceFrame(true, 0, 60, 0))
+	d.OnPacket(raceFrame(true, 1, 60, 70.0))
+	d.OnPacket(raceFrame(true, 1, 60, 70.0))
 
-	// Race ends mid-lap (IsRaceOn 1→0): the in-flight lap is incomplete.
-	if c := d.OnPacket(raceFrame(false, 0, 0, 0)); c != nil {
-		t.Fatalf("race-end frame should not emit, got %+v", c)
+	// DNF mid-lap-1 (IsRaceOn 1→0): the in-flight lap is incomplete.
+	if c := d.OnPacket(raceFrame(false, 1, 0, 0)); c != nil {
+		t.Fatalf("race-end mid-circuit should not emit, got %+v", c)
 	}
 
 	// A fresh race starts; the previous buffer must be gone, so a 0→1 here
