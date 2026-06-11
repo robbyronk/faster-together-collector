@@ -17,14 +17,30 @@ const PacketSize = 324
 
 // Dash is a typed view of the fields we need from a 324-byte packet.
 type Dash struct {
-	IsRaceOn         bool    // true while a race/event is active (false in free roam / menus)
-	LapNumber        uint16
-	LastLapTimeSec   float32 // seconds, with milliseconds preserved
-	CurrentSpeedMps  float32 // m/s
-	CarID            int32
-	CarClass         uint8
-	PerformanceIndex int32
-	DrivetrainType   int32
+	// IsRaceOn is true whenever the player is driving and the game is not
+	// paused — INCLUDING free roam. Verified against real FH6 captures: free
+	// roam streams IsRaceOn=1 with DistanceTraveledM pinned at exactly 0.
+	// Use InRace to tell an actual race/event from free roam.
+	IsRaceOn          bool
+	TimestampMS       uint32 // game-side ms tick; consecutive frames are ~16 ms apart
+	LapNumber         uint16
+	LastLapTimeSec    float32 // seconds, with milliseconds preserved
+	CurrentLapSec     float32 // seconds into the current lap; resets to 0 at each line crossing
+	CurrentSpeedMps   float32 // m/s
+	DistanceTraveledM float32 // meters since race start; exactly 0 in free roam, negative during the start countdown
+	CarID             int32
+	CarClass          uint8
+	PerformanceIndex  int32
+	DrivetrainType    int32
+}
+
+// InRace reports whether the frame was captured during an actual race/event.
+// IsRaceOn alone is not enough: FH6 keeps it 1 in free roam. The reliable
+// discriminator (verified empirically) is DistanceTraveledM, which is exactly
+// 0.0 for entire free-roam stints but nonzero during a race — negative while
+// rolling up to the start line during the countdown, then climbing.
+func (d Dash) InRace() bool {
+	return d.IsRaceOn && d.DistanceTraveledM != 0
 }
 
 // ErrWrongSize is returned when the input is not exactly PacketSize bytes.
@@ -46,7 +62,8 @@ var ErrWrongSize = errors.New("forza: packet must be 324 bytes")
 // Reference (Motorsport offsets; add 12 for the dash fields):
 // https://support.forzamotorsport.net/hc/en-us/articles/21742934024211
 const (
-	offIsRaceOn = 0 // int32 (sled; 0 in free roam / menus, 1 while racing)
+	offIsRaceOn    = 0 // int32 (sled; 0 in menus/paused, 1 while driving — including free roam)
+	offTimestampMS = 4 // uint32 (sled)
 
 	// Car-info block: lives in the sled, so these are NOT +12 shifted.
 	offCarID            = 212 // int32 (CarOrdinal)
@@ -55,9 +72,11 @@ const (
 	offDrivetrainType   = 224 // int32
 
 	// Dash fields: Motorsport offset + 12.
-	offCurrentSpeedMps = 256 // float32 (Motorsport 244 + 12)
-	offLastLapTime     = 300 // float32 (Motorsport 288 + 12)
-	offLapNumber       = 312 // uint16  (Motorsport 300 + 12)
+	offCurrentSpeedMps  = 256 // float32 (Motorsport 244 + 12)
+	offDistanceTraveled = 292 // float32 (Motorsport 280 + 12)
+	offLastLapTime      = 300 // float32 (Motorsport 288 + 12)
+	offCurrentLapTime   = 304 // float32 (Motorsport 292 + 12)
+	offLapNumber        = 312 // uint16  (Motorsport 300 + 12)
 )
 
 // Decode reads the dash fields from a 324-byte packet.
@@ -67,14 +86,17 @@ func Decode(packet []byte) (Dash, error) {
 	}
 
 	return Dash{
-		IsRaceOn:         binary.LittleEndian.Uint32(packet[offIsRaceOn:]) != 0,
-		LapNumber:        binary.LittleEndian.Uint16(packet[offLapNumber:]),
-		LastLapTimeSec:   math.Float32frombits(binary.LittleEndian.Uint32(packet[offLastLapTime:])),
-		CurrentSpeedMps:  math.Float32frombits(binary.LittleEndian.Uint32(packet[offCurrentSpeedMps:])),
-		CarID:            int32(binary.LittleEndian.Uint32(packet[offCarID:])),
-		CarClass:         packet[offCarClass],
-		PerformanceIndex: int32(binary.LittleEndian.Uint32(packet[offPerformanceIndex:])),
-		DrivetrainType:   int32(binary.LittleEndian.Uint32(packet[offDrivetrainType:])),
+		IsRaceOn:          binary.LittleEndian.Uint32(packet[offIsRaceOn:]) != 0,
+		TimestampMS:       binary.LittleEndian.Uint32(packet[offTimestampMS:]),
+		LapNumber:         binary.LittleEndian.Uint16(packet[offLapNumber:]),
+		LastLapTimeSec:    math.Float32frombits(binary.LittleEndian.Uint32(packet[offLastLapTime:])),
+		CurrentLapSec:     math.Float32frombits(binary.LittleEndian.Uint32(packet[offCurrentLapTime:])),
+		CurrentSpeedMps:   math.Float32frombits(binary.LittleEndian.Uint32(packet[offCurrentSpeedMps:])),
+		DistanceTraveledM: math.Float32frombits(binary.LittleEndian.Uint32(packet[offDistanceTraveled:])),
+		CarID:             int32(binary.LittleEndian.Uint32(packet[offCarID:])),
+		CarClass:          packet[offCarClass],
+		PerformanceIndex:  int32(binary.LittleEndian.Uint32(packet[offPerformanceIndex:])),
+		DrivetrainType:    int32(binary.LittleEndian.Uint32(packet[offDrivetrainType:])),
 	}, nil
 }
 
@@ -86,9 +108,12 @@ func EncodeForTest(d Dash) []byte {
 	if d.IsRaceOn {
 		binary.LittleEndian.PutUint32(packet[offIsRaceOn:], 1)
 	}
+	binary.LittleEndian.PutUint32(packet[offTimestampMS:], d.TimestampMS)
 	binary.LittleEndian.PutUint16(packet[offLapNumber:], d.LapNumber)
 	binary.LittleEndian.PutUint32(packet[offLastLapTime:], math.Float32bits(d.LastLapTimeSec))
+	binary.LittleEndian.PutUint32(packet[offCurrentLapTime:], math.Float32bits(d.CurrentLapSec))
 	binary.LittleEndian.PutUint32(packet[offCurrentSpeedMps:], math.Float32bits(d.CurrentSpeedMps))
+	binary.LittleEndian.PutUint32(packet[offDistanceTraveled:], math.Float32bits(d.DistanceTraveledM))
 	binary.LittleEndian.PutUint32(packet[offCarID:], uint32(d.CarID))
 	packet[offCarClass] = d.CarClass
 	binary.LittleEndian.PutUint32(packet[offPerformanceIndex:], uint32(d.PerformanceIndex))

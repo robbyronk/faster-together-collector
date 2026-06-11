@@ -15,15 +15,22 @@ func frame(lap uint16, speed float32, lastLapTime float32) []byte {
 }
 
 func raceFrame(racing bool, lap uint16, speed float32, lastLapTime float32) []byte {
+	// In a real race DistanceTraveledM is nonzero (negative during the start
+	// countdown, then climbing); it is exactly 0 only out of race / free roam.
+	var dist float32
+	if racing {
+		dist = 5000
+	}
 	return forza.EncodeForTest(forza.Dash{
-		IsRaceOn:         racing,
-		LapNumber:        lap,
-		LastLapTimeSec:   lastLapTime,
-		CurrentSpeedMps:  speed,
-		CarID:            1234,
-		CarClass:         5,
-		PerformanceIndex: 825,
-		DrivetrainType:   2,
+		IsRaceOn:          racing,
+		LapNumber:         lap,
+		LastLapTimeSec:    lastLapTime,
+		CurrentSpeedMps:   speed,
+		DistanceTraveledM: dist,
+		CarID:             1234,
+		CarClass:          5,
+		PerformanceIndex:  825,
+		DrivetrainType:    2,
 	})
 }
 
@@ -158,6 +165,92 @@ func TestDetectorSprintLobbyNoMovementNotEmitted(t *testing.T) {
 	// Race ends but car never moved (pre-race lobby noise) — must not emit.
 	if c := d.OnPacket(raceFrame(false, 0, 0, 0)); c != nil {
 		t.Fatalf("lobby session with zero speed should not emit, got %+v", c)
+	}
+}
+
+// fullFrame is raceFrame with explicit CurrentLapSec and TimestampMS.
+func fullFrame(lap uint16, lastLapTime, currentLap float32, ts uint32) []byte {
+	return forza.EncodeForTest(forza.Dash{
+		IsRaceOn:          true,
+		TimestampMS:       ts,
+		LapNumber:         lap,
+		LastLapTimeSec:    lastLapTime,
+		CurrentLapSec:     currentLap,
+		CurrentSpeedMps:   50,
+		DistanceTraveledM: 5000,
+		CarID:             1234,
+	})
+}
+
+func TestDetectorStreamGapDiscardsBuffer(t *testing.T) {
+	d := NewDetector()
+	d.OnPacket(fullFrame(0, 0, 0.0, 0))
+	d.OnPacket(fullFrame(0, 0, 0.5, 16))
+
+	// 100 s of frames lost mid-race; the stream resumes mid-lap 1. The lap-0
+	// fragment must not be emitted, and lap 1 (start unseen) must not be
+	// emitted at its boundary either.
+	if c := d.OnPacket(fullFrame(1, 55.0, 30.0, 100000)); c != nil {
+		t.Fatalf("boundary right after a stream gap must not emit, got %+v", c)
+	}
+	if c := d.OnPacket(fullFrame(2, 44.0, 0.0, 100016)); c != nil {
+		t.Fatalf("lap whose start fell inside the gap must not emit, got %+v", c)
+	}
+
+	// Lap 2 began at the previous boundary, so it emits normally.
+	completed := d.OnPacket(fullFrame(3, 47.5, 0.0, 100032))
+	if completed == nil {
+		t.Fatal("expected emit for the first fully observed lap after the gap")
+	}
+	if completed.LapTimeSec != 47.5 {
+		t.Errorf("LapTimeSec=%v, want 47.5", completed.LapTimeSec)
+	}
+}
+
+func TestDetectorMidLapStartNotEmitted(t *testing.T) {
+	d := NewDetector()
+
+	// Collector launched mid-race, 50 s into lap 3: that lap's blob would be
+	// a fragment, so it must not be emitted at the 3→4 boundary.
+	d.OnPacket(fullFrame(3, 60.0, 50.0, 0))
+	if c := d.OnPacket(fullFrame(4, 90.0, 0.0, 16)); c != nil {
+		t.Fatalf("partially observed lap must not emit, got %+v", c)
+	}
+
+	// Lap 4 was observed from its start; it emits at the 4→5 boundary.
+	completed := d.OnPacket(fullFrame(5, 85.0, 0.0, 32))
+	if completed == nil {
+		t.Fatal("expected emit for fully observed lap 4")
+	}
+	if completed.LapTimeSec != 85.0 {
+		t.Errorf("LapTimeSec=%v, want 85.0", completed.LapTimeSec)
+	}
+}
+
+func TestDetectorIgnoresFreeRoamWithRaceOnFlagSet(t *testing.T) {
+	d := NewDetector()
+
+	// FH6 free roam: IsRaceOn stays 1 but DistanceTraveledM is exactly 0.
+	// These frames must not be buffered or emitted as sprints.
+	for _, spd := range []float32{10, 39, 56} {
+		freeRoam := forza.EncodeForTest(forza.Dash{
+			IsRaceOn:        true,
+			CurrentSpeedMps: spd,
+			CarID:           1234,
+		})
+		if c := d.OnPacket(freeRoam); c != nil {
+			t.Fatalf("free-roam frame (IsRaceOn=1, dist=0) should not emit, got %+v", c)
+		}
+	}
+
+	// A race then starts; its first lap must contain only race frames.
+	d.OnPacket(raceFrame(true, 0, 60, 0))
+	completed := d.OnPacket(raceFrame(true, 1, 60, 61.0))
+	if completed == nil {
+		t.Fatal("expected emit on 0→1 once racing")
+	}
+	if n := gunzipLen(t, completed.Blob) / forza.PacketSize; n != 1 {
+		t.Errorf("blob has %d frames, want 1 (free-roam frames must be excluded)", n)
 	}
 }
 
